@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
 ROOT_DIR = os.path.dirname(__file__)
 
-MAIN_CUDA_VERSION = "12.1"
+MAIN_CUDA_VERSION = "11.8"
 
 # Supported NVIDIA GPU architectures.
 SUPPORTED_ARCHS = {"7.0", "7.5", "8.0", "8.6", "8.9", "9.0"}

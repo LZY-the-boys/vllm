@@ -11,7 +11,7 @@ from torch import nn
 
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import PagedAttention
+from vllm.model_executor.layers.attention import PagedAttention, PagedAttentionWithRoPE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
@@ -97,30 +97,30 @@ class QWenAttention(nn.Module):
             linear_method=linear_method,
         )
         self.scaling = self.head_dim**-0.5
-
-        self.rotary_emb = get_rope(
+        self.attn = PagedAttentionWithRoPE(
+            self.num_heads,
             self.head_dim,
+            self.scaling,
             rotary_dim=self.head_dim,
-            max_position=max_position_embeddings,
             base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-        self.attn = PagedAttention(self.num_heads, self.head_dim, self.scaling)
+            max_position=max_position_embeddings,
+            rope_scaling=rope_scaling)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        input_true_seq_len: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
     ) -> torch.Tensor:
         qkv, _ = self.c_attn(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+
         k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata,
-                                cache_event)
+        attn_output = self.attn(positions, input_true_seq_len, q, k, v, k_cache, v_cache,
+                                input_metadata, cache_event)
 
         output, _ = self.c_proj(attn_output)
         return output
@@ -155,6 +155,7 @@ class QWenBlock(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        input_true_seq_len: torch.Tensor,
         kv_cache: KVCache,
         input_metadata: InputMetadata,
         cache_event: Optional[torch.cuda.Event],
@@ -169,6 +170,7 @@ class QWenBlock(nn.Module):
         hidden_states = self.attn(
             positions=positions,
             hidden_states=hidden_states,
+            input_true_seq_len=input_true_seq_len,
             kv_cache=kv_cache,
             input_metadata=input_metadata,
             cache_event=cache_event,
@@ -205,6 +207,7 @@ class QWenModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        input_true_seq_len: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
@@ -217,6 +220,7 @@ class QWenModel(nn.Module):
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
+                input_true_seq_len,
                 kv_caches[i],
                 input_metadata,
                 cache_event,
@@ -244,11 +248,12 @@ class QWenLMHeadModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+            input_true_seq_len: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         cache_events: Optional[List[torch.cuda.Event]],
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, kv_caches,
+        hidden_states = self.transformer(input_ids, positions, input_true_seq_len, kv_caches,
                                          input_metadata, cache_events)
         return hidden_states
 

@@ -45,7 +45,7 @@ class ModelRunner:
         slot_mapping: List[List[int]] = []
 
         prompt_lens: List[int] = []
-        for seq_group_metadata in seq_group_metadata_list:
+        for i, seq_group_metadata in enumerate(seq_group_metadata_list):
             assert seq_group_metadata.is_prompt
             seq_ids = list(seq_group_metadata.seq_data.keys())
             assert len(seq_ids) == 1
@@ -97,6 +97,11 @@ class ModelRunner:
                                                 max_prompt_len,
                                                 pad=0,
                                                 dtype=torch.long)
+
+        input_true_seq_len_tensor = torch.tensor(prompt_lens,
+                                           dtype=torch.long,
+                                           device="cuda")
+
         slot_mapping = _make_tensor_with_pad(slot_mapping,
                                              max_prompt_len,
                                              pad=_PAD_SLOT_ID,
@@ -109,7 +114,7 @@ class ModelRunner:
             context_lens=None,
             block_tables=None,
         )
-        return input_tokens, input_positions, input_metadata
+        return input_tokens, input_positions, input_metadata, input_true_seq_len_tensor
 
     def _prepare_decode(
         self,
@@ -122,7 +127,7 @@ class ModelRunner:
         context_lens: List[int] = []
         block_tables: List[List[int]] = []
 
-        for seq_group_metadata in seq_group_metadata_list:
+        for i, seq_group_metadata in enumerate(seq_group_metadata_list):
             assert not seq_group_metadata.is_prompt
 
             seq_ids = list(seq_group_metadata.seq_data.keys())
@@ -159,6 +164,11 @@ class ModelRunner:
                                                 max_len=1,
                                                 pad=0,
                                                 dtype=torch.long)
+
+        input_true_seq_len_tensor = torch.tensor(context_lens,
+                                           dtype=torch.long,
+                                           device="cuda")
+
         slot_mapping = _make_tensor_with_pad(slot_mapping,
                                              max_len=1,
                                              pad=_PAD_SLOT_ID,
@@ -180,7 +190,7 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
         )
-        return input_tokens, input_positions, input_metadata
+        return input_tokens, input_positions, input_metadata, input_true_seq_len_tensor
 
     def _prepare_sample(
         self,
@@ -265,10 +275,10 @@ class ModelRunner:
         is_prompt = seq_group_metadata_list[0].is_prompt
         if is_prompt:
             inputs = self._prepare_prompt(seq_group_metadata_list)
-            input_tokens, input_positions, input_metadata = inputs
+            input_tokens, input_positions, input_metadata, input_true_seq_len = inputs
         else:
             inputs = self._prepare_decode(seq_group_metadata_list)
-            input_tokens, input_positions, input_metadata = inputs
+            input_tokens, input_positions, input_metadata, input_true_seq_len = inputs
         sampling_metadata = self._prepare_sample(seq_group_metadata_list,
                                                  input_metadata.prompt_lens)
 
@@ -279,6 +289,7 @@ class ModelRunner:
             kv_caches=kv_caches,
             input_metadata=input_metadata,
             cache_events=cache_events,
+            input_true_seq_len=input_true_seq_len,
         )
 
         # Sample the next token.
@@ -303,6 +314,10 @@ class ModelRunner:
             seq_len = (max_num_batched_tokens // max_num_seqs +
                        (group_id < max_num_batched_tokens % max_num_seqs))
             seq_data = SequenceData([0] * seq_len)
+
+            sampling_params = SamplingParams(top_p=0.99, top_k=vocab_size - 1)
+            sampling_params.prompt_token_length = seq_len
+
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
                 is_prompt=True,

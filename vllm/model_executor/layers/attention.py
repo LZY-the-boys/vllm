@@ -1,5 +1,5 @@
 """Multi-head attention."""
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -10,6 +10,9 @@ from xformers.ops.fmha.attn_bias import (BlockDiagonalCausalMask,
 from vllm._C import ops
 from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
+from vllm.model_executor.layers.rotary_embedding import (
+    DynamicNTKScalingRotaryEmbedding, LinearScalingRotaryEmbedding,
+    RotaryEmbedding)
 
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 # Should be the same as PARTITION_SIZE in `paged_attention_v2_launcher`.
@@ -280,3 +283,164 @@ def _paged_attention(
             alibi_slopes,
         )
     return output
+
+class PagedAttentionWithRoPE(PagedAttention):
+    """PagedAttention with rotary positional embedding."""
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        rotary_dim: int,
+        max_position: int = 8192,
+        base: int = 10000,
+        num_kv_heads: Optional[int] = None,
+        is_neox_style: bool = True,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        sliding_window: Optional[int] = None,
+    ) -> None:
+        super().__init__(num_heads,
+                         head_size,
+                         scale,
+                         num_kv_heads,
+                         sliding_window=sliding_window)
+        if rope_scaling is None:
+            self.rotary_emb = RotaryEmbedding(head_size, rotary_dim,
+                                              max_position, base,
+                                              is_neox_style)
+            #self.rotary_emb = RotaryEmbedding(head_size, rotary_dim,
+            #                                  max_position, base,
+            #                                  is_neox_style)
+            self.rotary_emb = DynamicNTKScalingRotaryEmbedding(head_size, rotary_dim,
+                                  max_position, base, is_neox_style, 2)
+        else:
+            scaling_type = rope_scaling["type"]
+            scaling_factor = rope_scaling["factor"]
+            if scaling_type == "linear":
+                self.rotary_emb = LinearScalingRotaryEmbedding(
+                    head_size, rotary_dim, max_position, base, is_neox_style,
+                    scaling_factor)
+            elif scaling_type == "dynamic":
+                self.rotary_emb = DynamicNTKScalingRotaryEmbedding(
+                    head_size, rotary_dim, max_position, base, is_neox_style,
+                    scaling_factor)
+            else:
+                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    def forward(
+        self,
+        positions: torch.Tensor,
+        input_true_seq_len: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        input_metadata: InputMetadata,
+        cache_event: Optional[torch.cuda.Event],
+    ) -> torch.Tensor:
+        """ PagedAttention forward pass with rotary embedding.
+        Args:
+            positions: shape = [batch_size, seq_len]
+            query: shape = [batch_size, seq_len, num_heads * head_size]
+            key: shape = [batch_size, seq_len, num_kv_heads * head_size]
+            value: shape = [batch_size, seq_len, num_kv_heads * head_size]
+            key_cache: shape = [num_blocks, num_kv_heads, head_size/x,
+                block_size, x]
+            value_cache: shape = [num_blocks, num_kv_heads, head_size,
+                block_size]
+            input_metadata: metadata for paged attention.
+            cache_event: event to wait for the cache operations to finish.
+        Returns:
+            shape = [batch_size, seq_len, num_heads * head_size]
+        """
+
+        # Apply rotary embedding to the query and key before passing them
+        # to the attention op.
+        query, key = self.rotary_emb(positions, input_true_seq_len, query, key)
+        return super().forward(
+            query,
+            key,
+            value,
+            key_cache,
+            value_cache,
+            input_metadata,
+            cache_event,
+        )
+class PagedAttentionWithALiBi(PagedAttention):
+    """PagedAttention with ALiBi attention bias."""
+    def __init__(self,
+                 num_heads: int,
+                 head_size: int,
+                 scale: float,
+                 slopes: List[float],
+                 num_kv_heads: Optional[int] = None) -> None:
+        super().__init__(num_heads, head_size, scale, num_kv_heads)
+        assert len(slopes) == num_heads
+        slopes = torch.tensor(slopes, dtype=torch.float32)
+        self.register_buffer("alibi_slopes", slopes, persistent=False)
+    def set_attn_bias(self, input_metadata: InputMetadata,
+                      dtype: torch.dtype) -> None:
+        if input_metadata.attn_bias is not None:
+            # Already set by a previous layer.
+            return
+        # Generates ALiBi mask based on the max prompt length.
+        max_prompt_len = input_metadata.max_prompt_len
+        bias = torch.arange(max_prompt_len, dtype=dtype)
+        # NOTE(zhuohan): HF uses
+        #     `bias = bias[None, :].repeat(prompt_len, 1)`
+        # here. We find that both biases give the same results, but
+        # the bias below more accurately follows the original ALiBi
+        # paper.
+        bias = bias[None, :] - bias[:, None]
+        bias = bias.to(self.alibi_slopes.device)
+        # When using custom attention bias, xformers requires the bias to
+        # be sliced from a tensor whose length is a multiple of 8.
+        padded_len = (max_prompt_len + 7) // 8 * 8
+        bias = torch.empty(
+            input_metadata.num_prompts,
+            self.num_heads,
+            max_prompt_len,
+            padded_len,
+            device=self.alibi_slopes.device,
+            dtype=dtype,
+        )[:, :, :, :max_prompt_len].copy_(bias)
+        bias.mul_(self.alibi_slopes[:, None, None])
+        attn_bias = LowerTriangularMaskWithTensorBias(bias)
+        input_metadata.attn_bias = attn_bias
+    def multi_query_kv_attention(
+        self,
+        output: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+        """Attention with ALiBi bias for the prompt tokens.
+        Args:
+            output: shape = [num_prompt_tokens, num_heads, head_size]
+            query: shape = [num_prompt_tokens, num_heads, head_size]
+            key: shape = [num_prompt_tokens, num_kv_heads, head_size]
+            value: shape = [num_prompt_tokens, num_kv_heads, head_size]
+            input_metadata: metadata for paged attention.
+        """
+        if self.num_kv_heads != self.num_heads:
+            # Project the key and value tensors to the desired number of heads.
+            key = torch.repeat_interleave(key, self.num_queries_per_kv, dim=1)
+            value = torch.repeat_interleave(value,
+                                            self.num_queries_per_kv,
+                                            dim=1)
+        batch_size = input_metadata.num_prompts
+        seq_len = input_metadata.max_prompt_len
+        out = xops.memory_efficient_attention_forward(
+            query.view(batch_size, seq_len, self.num_heads, self.head_size),
+            key.view(batch_size, seq_len, self.num_heads, self.head_size),
+            value.view(batch_size, seq_len, self.num_heads, self.head_size),
+            attn_bias=input_metadata.attn_bias,
+            p=0.0,
+            scale=self.scale,
+        )
+        # TODO(woosuk): Unnecessary copy. Optimize.
+        output.copy_(out.view(-1, self.num_heads, self.head_size))
+        return output
+    def get_alibi_slopes(self) -> Optional[torch.Tensor]:
+        return self.alibi_slopes

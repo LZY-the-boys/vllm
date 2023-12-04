@@ -168,6 +168,23 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def forward(
+        self,
+        positions: torch.Tensor,
+        input_true_seq_len: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # pos_encoding_ops.rotary_embedding() is an in-place operation that
+        # updates the query and key tensors.
+        #print('input_true_seq_len ', input_true_seq_len, input_true_seq_len.dtype, input_true_seq_len.shape)
+        #print('positions ', positions.dtype, positions.shape)
+        #print('query ', query.dtype, query.shape)
+        ops.rotary_embedding(positions, input_true_seq_len, query, key,
+                                          self.head_size, self.cos_sin_cache,
+                                          self.is_neox_style)
+        return query, key
+
 
 # Inverse dim formula to find dim based on number of rotations
 def _yarn_find_correction_dim(num_rotations: int,

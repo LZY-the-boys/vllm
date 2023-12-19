@@ -72,6 +72,7 @@ class QWenAttention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: Optional[Dict[str, Any]] = None,
         linear_method: Optional[LinearMethodBase] = None,
+        sliding_window: Optional[int] = None
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -82,6 +83,7 @@ class QWenAttention(nn.Module):
         self.num_heads = (self.total_num_heads //
                           tensor_model_parallel_world_size)
         self.head_dim = hidden_size // self.total_num_heads
+        self.sliding_window = sliding_window
 
         self.c_attn = QKVParallelLinear(
             hidden_size,
@@ -104,7 +106,9 @@ class QWenAttention(nn.Module):
             rotary_dim=self.head_dim,
             base=rope_theta,
             max_position=max_position_embeddings,
-            rope_scaling=rope_scaling)
+            rope_scaling=rope_scaling,
+            sliding_window=self.sliding_window
+        )
 
     def forward(
         self,
@@ -143,7 +147,8 @@ class QWenBlock(nn.Module):
                                   config.max_position_embeddings,
                                   rope_theta=rope_theta,
                                   rope_scaling=rope_scaling,
-                                  linear_method=linear_method)
+                                  linear_method=linear_method,
+                                  sliding_window=config.sliding_window if hasattr(config, "sliding_window") else None)
 
         self.ln_2 = RMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
 

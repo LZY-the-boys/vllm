@@ -4,7 +4,7 @@ import re
 import subprocess
 from typing import List, Set
 import warnings
-
+from importlib.metadata import PackageNotFoundError, version
 from packaging.version import parse, Version
 import setuptools
 import torch
@@ -12,7 +12,7 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME, 
 
 ROOT_DIR = os.path.dirname(__file__)
 
-MAIN_CUDA_VERSION = "12.1"
+MAIN_CUDA_VERSION = "11.8"
 
 # Supported NVIDIA GPU architectures.
 NVIDIA_SUPPORTED_ARCHS = {"7.0", "7.5", "8.0", "8.6", "8.9", "9.0"}
@@ -332,7 +332,6 @@ def get_requirements() -> List[str]:
             requirements = f.read().strip().split("\n")
     return requirements
 
-
 package_data = {"vllm": ["py.typed"]}
 if os.environ.get("VLLM_USE_PRECOMPILED"):
     ext_modules = []
@@ -364,6 +363,7 @@ setuptools.setup(
                                                "examples", "tests")),
     python_requires=">=3.8",
     install_requires=get_requirements(),
+    dependency_links=['https://huggingface.github.io/autogptq-index/whl/cu118/'], # important
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension} if not _is_neuron() else {},
     package_data=package_data,
